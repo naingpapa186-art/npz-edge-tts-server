@@ -54,8 +54,12 @@ app.add_middleware(
 )
 
 VOICES = {
-    "my-MM-ThihaNeural": "Thiha (အမျိုးသား)",
-    "my-MM-NilarNeural": "Nilar (အမျိုးသမီး)",
+    # key တွေက App / client က ပို့တဲ့ voice နာမည်တွေ; value ကတော့ Edge TTS ကို
+    # ပေးရမယ့် voice နာမည် အစစ် ဖြစ်ရမယ် (display label ပေးလို့ မရဘူး —
+    # "Nilar (အမျိုးသမီး)" လို label ပေးမိရင် Edge က Invalid voice ဆိုပြီး
+    # 502 ပြန်တယ်, ဒါကြောင့် canonical နာမည်ကို သူ့အတိုင်း ပြန်ပေးတယ်)
+    "my-MM-ThihaNeural": "my-MM-ThihaNeural",
+    "my-MM-NilarNeural": "my-MM-NilarNeural",
     "male": "my-MM-ThihaNeural",
     "female": "my-MM-NilarNeural",
     "thiha": "my-MM-ThihaNeural",
