@@ -333,10 +333,19 @@ async def gemini_srt(req: GeminiSrtRequest):
     lang_text = "မြန်မာ" if req.language in ("myanmar", "my", "မြန်မာ") else req.language
     style_text = req.narration_style or "story"
     prompt = (
-        "Transcribe the spoken audio in this clip and return ONLY a valid SRT subtitle file. "
-        f"Language: {lang_text}. Narration style: {style_text}. "
+        "You are a movie-recap narrator, NOT a transcriber. Listen to the audio in this clip "
+        "and return ONLY a valid SRT subtitle file containing timed RECAP NARRATION. "
+        "Do NOT transcribe, quote, copy or translate word-for-word what the characters say. "
+        "Instead, understand what is HAPPENING in each timed part and write third-person "
+        "storytelling narration that summarizes the scene and the action — what the characters "
+        "do, where they are, and what happens next — like the narration of a movie-recap video. "
+        f"Language: {lang_text} — write every narration line ONLY in {lang_text}, whatever "
+        "language is spoken in the audio; never output text in the audio's original language "
+        "and never mix languages. "
+        f"Narration style: {style_text}. "
         f"The clip starts at {start:.1f} seconds in the original video, so SRT timestamps must start from there. "
-        "Each cue: number, HH:MM:SS,mmm --> HH:MM:SS,mmm, then 1-2 lines of subtitle text. "
+        "Each cue: number, HH:MM:SS,mmm --> HH:MM:SS,mmm, then ONE short narration sentence (1-2 lines max). "
+        "Cues must never overlap: each cue ends before the next one starts. "
         "Do not add any explanation, markdown, or extra text — output SRT only."
     )
     contents = [
