@@ -17,6 +17,16 @@ API:
                        -> {ok, status, srt, raw_text}
   POST /eleven-tts   -> JSON {key, voice_id, model, text, stability, similarity_boost} -> MP3 bytes
   POST /eleven-voices -> JSON {key} -> {ok, voices: [{voice_id, name, labels}]}
+  POST /assembly-test  -> JSON {key} -> {ok} (AssemblyAI Key စမ်းမယ်)
+  POST /assembly-start -> JSON {key, audio_base64, source_language, target_languages}
+                       -> {ok, transcript_id} (audio တင် + transcribe + translate တောင်းမယ်)
+  POST /assembly-status -> JSON {key, transcript_id, target_language}
+                       -> {ok, transcript_status, myanmar_text, cues: [{start, end, text}]}
+                       (ပြီးရင် မြန်မာ ဘာသာပြန် + အချိန်ပါတဲ့ စာကြောင်းတွေ ပြန်ပေးတယ်)
+  GET  /messenger-webhook -> Meta webhook verification (hub.mode / hub.verify_token / hub.challenge)
+  POST /messenger-webhook -> Facebook Page ကို လာတဲ့ စာတွေ လက်ခံ + keyword နဲ့ auto-reply ပြန်ပို့တယ်
+                       (FB_PAGE_ACCESS_TOKEN / FB_VERIFY_TOKEN / FB_PAGE_ID / FB_APP_SECRET ကို
+                       Railway Variables ထဲမှာပဲ ထည့်ရမယ် — code / GitHub ထဲ မထည့်ရ)
 
 အသံများ:
   my-MM-ThihaNeural (အမျိုးသား) / my-MM-NilarNeural (အမျိုးသမီး)
@@ -27,20 +37,30 @@ ElevenLabs အတွက်လည်း အတူတူပဲ — NPZ ရဲ့�
 App ထဲကနေ တစ်ခါသုံးအဖြစ် ပို့ရမယ်, Server က Key ကို ဘယ်နေရာမှ မသိမ်းဘူး။
 ElevenLabs v4 model က Burmese (my) ထောက်ပံ့တယ် — အသံကောင်းမကောင်း စမ်းကြည့်ရမယ်။
 Free tier: တစ်လ 10,000 characters (~10 မိနစ်), commercial use မရ။
+AssemblyAI အတွက်လည်း အတူတူပဲ — NPZ ရဲ့ကိုယ်ပိုင် AssemblyAI API Key ကို
+App / စာမျက်နှာကနေ တစ်ခါသုံးအဖြစ် ပို့ရမယ်, Server က Key ကို ဘယ်နေရာမှ မသိမ်းဘူး။
+AssemblyAI: Universal-2 transcription $0.15 / audio နာရီ + Translation $0.06 / audio နာရီ;
+အကောင့်အသစ် $50 free credits (ကတ်မလို)။ မြန်မာ (my) ကို translation target အဖြစ်
+ထောက်ပံ့လား — စာမျက်နှာမှာ အတည်မပြုနိုင်သေးဘူး; /assembly-status က
+translation_ok နဲ့ ပြန်ပြောတယ်။
 
 Run (local):
   pip install -r requirements.txt
   uvicorn server:app --host 0.0.0.0 --port 8000
 """
+import base64
+import hashlib
+import hmac
+import json
 import os
 import re
 import tempfile
 
 import edge_tts
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, field_validator
 
 app = FastAPI(title="NPZ Edge TTS + Gemini Proxy Server")
@@ -68,9 +88,11 @@ VOICES = {
 
 GEMINI_MODELS = {
     "gemini-3.8-flash",
-    "gemini-3.8-flash-lite",
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
+    "gemini-3.1-pro-preview",
+    "gemini-3.7-flash",
+    "gemini-2.5-flash",
 }
 
 ELEVEN_MODELS = {
@@ -280,12 +302,63 @@ async def index():
 <p>Thiha / Nilar အသံကို MP3 ထုတ်ပေးတယ် + Gemini SRT ကို Server ဘက်ကနေ ခေါ်ပေးတယ် + ElevenLabs အသံကို Server ဘက်ကနေ ခေါ်ပေးတယ်။</p>
 <p>TTS စမ်းဖို့: <a href="/tts?text=%E1%80%99%E1%80%84%E1%80%BA%E1%80%82%E1%80%9C%E1%80%AC%E1%80%95%E1%80%AB&voice=my-MM-NilarNeural">/tts?text=မင်္ဂလာပါ&voice=my-MM-NilarNeural</a></p>
 <p>App ထဲမှာ ဒီ Server ရဲ့ URL ကို ထည့်ရမယ် — ဥပမာ https://xxx.up.railway.app</p>
+<p>Facebook Messenger webhook: <code>https://xxx.up.railway.app/messenger-webhook</code> (FB_PAGE_ACCESS_TOKEN / FB_VERIFY_TOKEN ကို Railway Variables ထဲမှာ ထည့်ရမယ်)</p>
+<hr>
+<h2>🎙️ AssemblyAI စမ်းမည် — တရုတ် အသံ → မြန်မာ ဘာသာပြန်</h2>
+<p>AssemblyAI API Key ကို အောက်မှာ ထည့်ပါ — Key ကို ဘယ်နေရာမှ မသိမ်းဘူး (ဒီ စာမျက်နှာမှာပဲ သုံးတယ်)။ Audio ဖိုင် (mp3/wav) ရွေးပြီး <b>▶ Translate စမ်းမည်</b> နှိပ်ပါ — Server က AssemblyAI ကို တင် + စာသားထုတ် + မြန်မာလို ပြန်ပေးပြီး အခြေအနေ ပြပေးမယ်။ မြန်မာ (my) ပြန်မလာရင် AssemblyAI က my ကို မထောက်ပံ့တာပါ။</p>
+<p>Key: <input id="aKey" type="password" placeholder="AssemblyAI API Key" style="width:320px"> <button onclick="aTest()">Key စမ်းမည်</button> <span id="aTestOut"></span></p>
+<p>အသံ ဖိုင်: <input id="aFile" type="file" accept="audio/*,video/*"></p>
+<p>အသံ ဘာသာ: <select id="aLang"><option value="zh">တရုတ် (zh)</option><option value="en">အင်္ဂလိပ် (en)</option><option value="auto">Auto</option></select>
+<button onclick="aStart()">▶ Translate စမ်းမည်</button></p>
+<pre id="aOut" style="white-space:pre-wrap;background:#111;color:#eee;padding:12px;border-radius:8px">...</pre>
+<script>
+let aTimer=null;
+async function aPost(path,body){
+  const r=await fetch(path,{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify(body)});
+  return r.json();
+}
+async function aTest(){
+  const k=document.getElementById('aKey').value.trim();
+  document.getElementById('aTestOut').textContent='စစ်နေတယ်…';
+  try{const d=await aPost('/assembly-test',{key:k});document.getElementById('aTestOut').textContent=d.ok?'✅ Key ရတယ်':'❌ '+(d.error||d.status);}catch(e){document.getElementById('aTestOut').textContent='❌ '+e;}
+}
+async function aStart(){
+  const k=document.getElementById('aKey').value.trim();
+  const f=document.getElementById('aFile').files[0];
+  const out=document.getElementById('aOut');
+  if(!k){out.textContent='Key ထည့်ပါ';return;}
+  if(!f){out.textContent='အသံ ဖိုင် ရွေးပါ';return;}
+  out.textContent='Audio တင်နေတယ်…';
+  const b64=await new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result.split(',')[1]);r.onerror=rej;r.readAsDataURL(f);});
+  let d;
+  try{d=await aPost('/assembly-start',{key:k,audio_base64:b64,source_language:document.getElementById('aLang').value,target_languages:['my']});}catch(e){out.textContent='❌ '+e;return;}
+  if(!d.ok){out.textContent='❌ '+(d.error||d.status);return;}
+  const id=d.transcript_id;
+  out.textContent='⏳ Transcribe + Translate လုပ်နေတယ်… (id: '+id+')';
+  if(aTimer)clearInterval(aTimer);
+  aTimer=setInterval(async()=>{
+    let s;
+    try{s=await aPost('/assembly-status',{key:k,transcript_id:id,target_language:'my'});}catch(e){out.textContent='❌ '+e;clearInterval(aTimer);return;}
+    if(!s.ok){out.textContent='❌ '+(s.error||s.status);clearInterval(aTimer);return;}
+    if(s.transcript_status!=='completed'){out.textContent='⏳ '+s.transcript_status+'…';return;}
+    clearInterval(aTimer);
+    let t='✅ ပြီးပြီ!\n\n';
+    t+='— မြန်မာ စာသား အပြည့် —\n'+(s.myanmar_text||'(မြန်မာ ပြန်မလာပါ)')+'\n\n';
+    if(s.warning)t+='⚠️ '+s.warning+'\n\n';
+    t+='— စာကြောင်း အလိုက် (အချိန် + မြန်မာ) —\n';
+    (s.cues||[]).forEach((c,i)=>{t+=(i+1)+'. ['+c.start+'s - '+c.end+'s] '+c.text+'\n';});
+    if(!(s.cues||[]).length)t+='(cue မရှိပါ — မြန်မာ ပြန်မလာတာ ဖြစ်နိုင်တယ်)\n';
+    t+='\n— မူရင်း စာသား —\n'+(s.text||'');
+    out.textContent=t;
+  },3000);
+}
+</script>
 </body></html>"""
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "voices": list(VOICES.keys())[:2], "gemini": True, "elevenlabs": True}
+    return {"ok": True, "voices": list(VOICES.keys())[:2], "gemini": True, "elevenlabs": True, "assemblyai": True, "messenger": True}
 
 
 @app.post("/tts")
@@ -779,6 +852,488 @@ async def rednote_resolve(req: RednoteResolveRequest):
         "cover": cover,
         "note_id": note_id,
     }
+
+
+# ---------------------------------------------------------------------------
+# AssemblyAI — Transcribe + Translate (တရုတ် အသံ → မြန်မာ ဘာသာပြန် စမ်းဖို့)
+# API key ကို App / client က တစ်ခါသုံးအဖြစ် ပို့ရမယ် — Server က Key ကို
+# ဘယ်နေရာမှ မသိမ်းဘူး (Gemini / ElevenLabs နဲ့ အတူတူပဲ)။
+# Universal-2 (99 ဘာသာ — တရုတ် + မြန်မာ ပါ): $0.15 / audio နာရီ
+# Translation add-on: $0.06 / audio နာရီ — 86 ဘာသာသို့ ပြန်ပေးတယ်။
+# မြန်မာ (my) ကို translation target အဖြစ် ထောက်ပံ့လား — AssemblyAI စာမျက်နှာမှာ
+# အတည်မပြုနိုင်သေးဘူး; /assembly-status က translation_ok နဲ့ ပြန်ပြောတယ်။
+# Translation က စာသား အပြည့်ပဲ ပြန်ပေးတာ — အချိန်ပါတဲ့ SRT တိုက်ရိုက်မရဘူး;
+# speaker labels + match_original_utterance နဲ့ utterance တစ်ပိုင်းချင်းစီကို
+# မြန်မာလို ပြန်ပေးတယ်, utterance တွေမှာ start/end (ms) ပါလို့ အဲဒါကနေ SRT cue လုပ်လို့ရတယ်။
+# ---------------------------------------------------------------------------
+
+ASSEMBLY_BASE = "https://api.assemblyai.com/v2"
+ASSEMBLY_MODEL = "universal-2"
+
+
+class AssemblyKeyRequest(BaseModel):
+    key: str
+
+    @field_validator("key")
+    @classmethod
+    def key_not_empty(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("AssemblyAI API Key ဗလာဖြစ်နေပါတယ်")
+        return v
+
+
+class AssemblyStartRequest(BaseModel):
+    key: str
+    audio_base64: str
+    source_language: str = "zh"
+    target_languages: list = ["my"]
+
+    @field_validator("key")
+    @classmethod
+    def key_not_empty(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("AssemblyAI API Key ဗလာဖြစ်နေပါတယ်")
+        return v
+
+    @field_validator("audio_base64")
+    @classmethod
+    def audio_ok(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("audio ဗလာဖြစ်နေပါတယ်")
+        if len(v) > MAX_AUDIO_B64_LEN:
+            raise ValueError("audio အပိုင်း ကြီးလွန်းပါတယ် — Video အတိုနဲ့ ပြန်စမ်းပါ")
+        return v
+
+    @field_validator("source_language")
+    @classmethod
+    def lang_ok(cls, v: str) -> str:
+        v = (v or "zh").strip().lower()
+        return v or "zh"
+
+    @field_validator("target_languages")
+    @classmethod
+    def targets_ok(cls, v) -> list:
+        if isinstance(v, str):
+            v = [v]
+        langs = []
+        for t in v or ["my"]:
+            t = str(t or "").strip().lower()
+            if t and t not in langs:
+                langs.append(t)
+        return langs[:3] or ["my"]
+
+
+class AssemblyStatusRequest(BaseModel):
+    key: str
+    transcript_id: str
+    target_language: str = "my"
+
+    @field_validator("key")
+    @classmethod
+    def key_not_empty(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("AssemblyAI API Key ဗလာဖြစ်နေပါတယ်")
+        return v
+
+    @field_validator("transcript_id")
+    @classmethod
+    def tid_not_empty(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("transcript_id ဗလာဖြစ်နေပါတယ်")
+        return v
+
+    @field_validator("target_language")
+    @classmethod
+    def target_ok(cls, v: str) -> str:
+        v = (v or "my").strip().lower()
+        return v or "my"
+
+
+def assembly_error_text(status: int, data) -> str:
+    try:
+        err = data.get("error", "")
+        if isinstance(err, dict):
+            return err.get("message", "") or str(err)
+        return str(err or "")
+    except AttributeError:
+        return ""
+
+
+def shape_assembly_result(data: dict, target: str = "my") -> dict:
+    """AssemblyAI completed transcript ကို App သုံးလို့လွယ်တဲ့ ပုံစံ ပြောင်းတယ်.
+    utterance တစ်ပိုင်းချင်းစီ = SRT cue တစ်ကြောင်း (start/end စက္ကန့် + မြန်မာစာသား)."""
+    translated = data.get("translated_texts") or {}
+    if not isinstance(translated, dict):
+        translated = {}
+    my_text = translated.get(target, "") or ""
+    cues = []
+    utterances = []
+    for u in data.get("utterances") or []:
+        if not isinstance(u, dict):
+            continue
+        start = (u.get("start") or 0) / 1000.0
+        end = (u.get("end") or 0) / 1000.0
+        ut = u.get("translated_texts") or {}
+        if not isinstance(ut, dict):
+            ut = {}
+        ut_my = ut.get(target, "") or ""
+        utterances.append(
+            {
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "speaker": u.get("speaker"),
+                "text": u.get("text", "") or "",
+                "translated": ut_my,
+            }
+        )
+        if ut_my:
+            cues.append({"start": round(start, 3), "end": round(end, 3), "text": ut_my})
+    words = []
+    for w in data.get("words") or []:
+        if not isinstance(w, dict):
+            continue
+        words.append(
+            {
+                "text": w.get("text", "") or "",
+                "start": round((w.get("start") or 0) / 1000.0, 3),
+                "end": round((w.get("end") or 0) / 1000.0, 3),
+                "speaker": w.get("speaker"),
+            }
+        )
+    return {
+        "text": data.get("text", "") or "",
+        "language_code": data.get("language_code", "") or "",
+        "myanmar_text": my_text,
+        "translation_ok": bool(my_text),
+        "translated_texts": translated,
+        "utterances": utterances,
+        "cues": cues,
+        "words": words,
+    }
+
+
+@app.post("/assembly-test")
+async def assembly_test(req: AssemblyKeyRequest):
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{ASSEMBLY_BASE}/transcript",
+                params={"limit": 1},
+                headers={"Authorization": req.key},
+            )
+    except httpx.TimeoutException:
+        return JSONResponse(status_code=504, content={"ok": False, "status": 504, "error": "AssemblyAI timeout"})
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"ok": False, "status": 502, "error": f"AssemblyAI ခေါ်မရပါ: {e}"})
+    if resp.status_code != 200:
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        return JSONResponse(
+            status_code=resp.status_code,
+            content={"ok": False, "status": resp.status_code, "error": assembly_error_text(resp.status_code, data) or "AssemblyAI Key မမှန်ပါ"},
+        )
+    return {"ok": True, "status": 200}
+
+
+@app.post("/assembly-start")
+async def assembly_start(req: AssemblyStartRequest):
+    try:
+        audio_bytes = base64.b64decode(req.audio_base64, validate=False)
+    except Exception:
+        return JSONResponse(status_code=422, content={"ok": False, "error": "audio base64 မမှန်ပါ"})
+    if not audio_bytes:
+        return JSONResponse(status_code=422, content={"ok": False, "error": "audio ဗလာဖြစ်နေပါတယ်"})
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            # 1) audio တင်မယ်
+            up = await client.post(
+                f"{ASSEMBLY_BASE}/upload",
+                content=audio_bytes,
+                headers={"Authorization": req.key, "Content-Type": "application/octet-stream"},
+            )
+            if up.status_code != 200:
+                try:
+                    data = up.json()
+                except Exception:
+                    data = {}
+                return JSONResponse(
+                    status_code=up.status_code,
+                    content={"ok": False, "status": up.status_code, "error": assembly_error_text(up.status_code, data) or "AssemblyAI upload မရပါ"},
+                )
+            upload_url = (up.json() or {}).get("upload_url", "")
+            if not upload_url:
+                return JSONResponse(status_code=502, content={"ok": False, "error": "AssemblyAI upload_url မရပါ"})
+            # 2) transcript + translation တောင်းမယ်
+            body = {
+                "audio_url": upload_url,
+                "speech_model": ASSEMBLY_MODEL,
+                "speaker_labels": True,
+                "speech_understanding": {
+                    "request": {
+                        "translation": {
+                            "target_languages": req.target_languages,
+                            "match_original_utterance": True,
+                            "formal": False,
+                        }
+                    }
+                },
+            }
+            if (req.source_language or "zh").lower() == "auto":
+                body["language_detection"] = True
+            else:
+                body["language_code"] = req.source_language
+            tr = await client.post(
+                f"{ASSEMBLY_BASE}/transcript",
+                json=body,
+                headers={"Authorization": req.key, "Content-Type": "application/json"},
+            )
+    except httpx.TimeoutException:
+        return JSONResponse(status_code=504, content={"ok": False, "status": 504, "error": "AssemblyAI timeout (120s)"})
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"ok": False, "status": 502, "error": f"AssemblyAI ခေါ်မရပါ: {e}"})
+    if tr.status_code != 200:
+        try:
+            data = tr.json()
+        except Exception:
+            data = {}
+        return JSONResponse(
+            status_code=tr.status_code,
+            content={"ok": False, "status": tr.status_code, "error": assembly_error_text(tr.status_code, data) or "AssemblyAI transcript တောင်းမရပါ"},
+        )
+    tr_data = tr.json() or {}
+    tid = tr_data.get("id", "")
+    if not tid:
+        return JSONResponse(status_code=502, content={"ok": False, "error": "AssemblyAI transcript_id မရပါ"})
+    return {"ok": True, "status": 200, "transcript_id": tid, "transcript_status": tr_data.get("status", "")}
+
+
+@app.post("/assembly-status")
+async def assembly_status(req: AssemblyStatusRequest):
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{ASSEMBLY_BASE}/transcript/{req.transcript_id}",
+                headers={"Authorization": req.key},
+            )
+    except httpx.TimeoutException:
+        return JSONResponse(status_code=504, content={"ok": False, "status": 504, "error": "AssemblyAI timeout"})
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"ok": False, "status": 502, "error": f"AssemblyAI ခေါ်မရပါ: {e}"})
+    if resp.status_code != 200:
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        return JSONResponse(
+            status_code=resp.status_code,
+            content={"ok": False, "status": resp.status_code, "error": assembly_error_text(resp.status_code, data) or "AssemblyAI status ဖတ်မရပါ"},
+        )
+    data = resp.json()
+    st = (data.get("status") or "").lower()
+    if st == "error":
+        return JSONResponse(status_code=502, content={"ok": False, "status": 502, "error": data.get("error", "") or "AssemblyAI transcription error"})
+    if st != "completed":
+        return {"ok": True, "status": 200, "transcript_status": st}
+    shaped = shape_assembly_result(data, target=req.target_language)
+    out = {"ok": True, "status": 200, "transcript_status": "completed", **shaped}
+    if not shaped["translation_ok"]:
+        out["warning"] = "မြန်မာ (my) ဘာသာပြန် ပြန်မလာပါ — AssemblyAI က my ကို translation target အဖြစ် မထောက်ပံ့တာ ဖြစ်နိုင်တယ်"
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Facebook Messenger Auto-Reply (ifonemaster Page အတွက်)
+# Meta (Facebook) က Page ကို လာတဲ့ စာတွေကို ဒီ Server ကို webhook နဲ့ ပို့တယ်;
+# Server က keyword ကြည့်ပြီး အဖြေ အလိုလို ပြန်ပို့တယ် (Send API)။
+#
+# လိုတာ (Railway Variables ထဲမှာပဲ ထည့်ရမယ် — code / GitHub / chat ထဲ လုံးဝ မထည့်ရ):
+#   FB_PAGE_ACCESS_TOKEN — Page ရဲ့ access token (Meta App Dashboard ကနေ ယူရမယ်)
+#   FB_VERIFY_TOKEN      — ကိုယ်တိုင် သတ်မှတ်တဲ့ စကားဝှက် (Meta Dashboard မှာ ရိုက်တဲ့ စာနဲ့ တူရမယ်)
+#   FB_PAGE_ID           — (optional) Page ID သိရင် ထည့်; မထည့်ရင် /me/messages လမ်းနဲ့ ပို့တယ်
+#   FB_APP_SECRET        — (optional) App Secret ထည့်ထားရင် webhook signature ကို စစ်တယ်
+#
+# Graph API v26.0 (current, 2026-07-29) သုံးတယ် — v21.0 က 2027-01-21 မှာ ပိတ်မယ်။
+# Send API: POST https://graph.facebook.com/v26.0/{PAGE_ID}/messages
+#   (သို့) /me/messages — {recipient: {id}, message: {text}, messaging_type: "RESPONSE"}
+# Webhook verify: GET ?hub.mode=subscribe&hub.verify_token=...&hub.challenge=...
+#   — token တူရင် challenge ကို အတိုင်း ပြန်ပေးတယ်။
+# Webhook POST: X-Hub-Signature-256 (HMAC-SHA256, App Secret) — secret ရှိမှ စစ်တယ်။
+# Meta က 200 OK ကို 5 စက္ကန့်အတွင်း မျှော်တယ် — ဒါကြောင့် အမြဲ 200 ပြန်တယ်,
+# ပို့မရရင်တောင် log ပဲ ရေးပြီး 200 ပြန်တယ် (မပြန်ရင် Meta က webhook ကို ပိတ်နိုင်တယ်)။
+#
+# ကန့်သတ်ချက် (အမှန်):
+# - RESPONSE အဖြေက user နောက်ဆုံး စာပို့ပြီး 24 နာရီအတွင်းပဲ ရတယ်။
+# - App က Development mode မှာ ရှိတုန်း admin/tester တွေရဲ့ စာပဲ ရတယ်;
+#   လူတိုင်းကို auto-reply ပြန်ချင်ရင် App ကို Live လုပ်ပြီး pages_messaging အတွက်
+#   App Review အောင်ရမယ် (Meta စစ်တာ ရက်ပိုင်းကြာနိုင်တယ်)။
+# - ဒါက keyword အဖြေပဲ — AI စကားပြော မဟုတ်ဘူး။ စာသားတွေ အောက်မှာ ပြင်လို့ရတယ်။
+# ---------------------------------------------------------------------------
+
+FB_GRAPH_VERSION = "v26.0"
+FB_GRAPH_BASE = f"https://graph.facebook.com/{FB_GRAPH_VERSION}"
+
+# --- ဒီနေရာမှာ ပြန်မယ့် စာသားတွေ ပြင်လို့ရတယ် ---
+# keyword တွေ ပါရင် အဲဒီ အဖြေကို ပြန်တယ် (အပေါ်က အတန်းက အရင် စစ်တယ်);
+# ဘာမှ မတိုက်ရင် MESSENGER_FALLBACK ကို ပြန်တယ်။
+MESSENGER_REPLIES = [
+    (
+        ["apple id", "apple"],
+        "🍎 Apple ID အကောင့် — 15,000 ကျပ် / 100 ဘတ် ပါ။\n"
+        "ဝယ်ယူရန်: နာမည်နဲ့ ဖုန်းနံပါတ် ပို့ပေးပါ။ အကောင့် ရပြီးမှ ငွေချေရပါတယ်။\n"
+        "📞 0952980185",
+    ),
+    (
+        ["gemini"],
+        "✨ Google Gemini 1 Year — 500 ဘတ် ပါ။\n"
+        "ဝယ်ယူရန် နာမည်နဲ့ ဖုန်းနံပါတ် ပို့ပေးပါ။\n"
+        "📞 0952980185",
+    ),
+    (
+        ["icloud", "unlock"],
+        "🔓 iCloud Unlock Service ရှိပါတယ်။\n"
+        "ဖုန်း model နဲ့ အခြေအနေ ပြောပေးပါ — လူကိုယ်တိုင် ပြန်ဖြေပေးပါမယ်။\n"
+        "📞 0952980185",
+    ),
+    (
+        ["ဈေး", "စျေး", "price", "ဘယ်လောက်"],
+        "🛍️ ifonemaster စျေးနှုန်း —\n"
+        "🍎 Apple ID: 15,000 ကျပ် / 100 ဘတ်\n"
+        "✨ Google Gemini 1 Year: 500 ဘတ်\n"
+        "🔓 iCloud Unlock Service: စုံစမ်းရန်\n"
+        "ဝယ်ယူရန် နာမည်နဲ့ ဖုန်းနံပါတ် ပို့ပေးပါ။",
+    ),
+    (
+        ["pay", "ငွေ", "binance", "truemoney", "true money", "kpay", "bank", "လွဲ"],
+        "💳 ငွေချေလို့ရတဲ့ နည်းတွေ — Binance, TrueMoney, Bank Transfer, KPay ပါ။\n"
+        "Apple ID ကတော့ အကောင့် ရပြီးမှ ငွေချေရပါတယ်။",
+    ),
+    (
+        ["ဝယ်", "buy", "လိုချင်"],
+        "ဝယ်ယူရန် နာမည်နဲ့ ဖုန်းနံပါတ် ပို့ပေးပါ။\n"
+        "🍎 Apple ID: 15,000 ကျပ် / 100 ဘတ်\n"
+        "✨ Google Gemini 1 Year: 500 ဘတ်\n"
+        "🔓 iCloud Unlock Service: စုံစမ်းရန်",
+    ),
+    (
+        ["မင်္ဂလာပါ", "hello", "hey", "hi"],
+        "မင်္ဂလာပါ 🙏 ifonemaster ပါ။\n"
+        "🍎 Apple ID: 15,000 ကျပ် / 100 ဘတ်\n"
+        "✨ Gemini 1 Year: 500 ဘတ်\n"
+        "🔓 iCloud Unlock Service\n"
+        "ဘာလိုချင်လဲ ပြောပေးပါ — ဥပမာ 'Apple ID' လို့ ရိုက်ပါ။",
+    ),
+]
+
+MESSENGER_FALLBACK = (
+    "မင်္ဂလာပါ 🙏 ifonemaster ပါ။ မေးချင်တာ နားမလည်လို့ —\n"
+    "🍎 Apple ID: 15,000 ကျပ် / 100 ဘတ်\n"
+    "✨ Gemini 1 Year: 500 ဘတ်\n"
+    "🔓 iCloud Unlock Service\n"
+    "'Apple ID' / 'Gemini' / 'ဈေး' လို့ ရိုက်ပြီး မေးလို့ရပါတယ်။ "
+    "လူကိုယ်တိုင် မကြာခင် ပြန်ဖြေပေးပါမယ်။\n"
+    "📞 0952980185"
+)
+
+
+def _kw_hit(text: str, kw: str) -> bool:
+    """keyword ပါမပါ စစ်တယ် — စကားလုံး အစမှာ ပါရင် ရတယ်
+    ('this' ထဲက 'hi' လို အလယ်မှာ ပါတာ မယူဘူး; 'ဈေးနှုန်း' ထဲက 'ဈေး' လို
+    အစမှာ ပါတာတော့ ယူတယ် — မြန်မာစာက စကားလုံးတွဲ ဖြစ်တတ်လို့)."""
+    kw = (kw or "").lower()
+    if not kw:
+        return False
+    return re.search(r"(?<!\w)" + re.escape(kw), text) is not None
+
+
+def match_messenger_reply(text: str) -> str:
+    t = (text or "").lower()
+    for keywords, reply in MESSENGER_REPLIES:
+        if any(_kw_hit(t, k) for k in keywords):
+            return reply
+    return MESSENGER_FALLBACK
+
+
+def fb_verify_signature(raw: bytes, signature: str) -> bool:
+    secret = os.environ.get("FB_APP_SECRET", "").strip()
+    if not secret:
+        return True  # App Secret မထည့်ထားရင် မစစ်ပါ (စမ်းသပ်နေတုန်း)
+    if not signature or not signature.startswith("sha256="):
+        return False
+    expected = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+    return hmac.compare_digest("sha256=" + expected, signature)
+
+
+async def fb_send_message(sender_id: str, text: str) -> bool:
+    token = os.environ.get("FB_PAGE_ACCESS_TOKEN", "").strip()
+    if not token:
+        print("[messenger] FB_PAGE_ACCESS_TOKEN မရှိပါ — စာပြန်မပို့ပါ (Railway Variables ထဲ ထည့်ပါ)")
+        return False
+    page_id = os.environ.get("FB_PAGE_ID", "").strip()
+    node = page_id if page_id else "me"
+    url = f"{FB_GRAPH_BASE}/{node}/messages"
+    body = {
+        "recipient": {"id": sender_id},
+        "message": {"text": text},
+        "messaging_type": "RESPONSE",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(url, params={"access_token": token}, json=body)
+    except Exception as e:
+        print(f"[messenger] send error: {e}")
+        return False
+    if resp.status_code != 200:
+        print(f"[messenger] send failed {resp.status_code}: {resp.text[:300]}")
+        return False
+    return True
+
+
+@app.get("/messenger-webhook")
+async def messenger_verify(request: Request):
+    params = request.query_params
+    mode = params.get("hub.mode", "")
+    token = params.get("hub.verify_token", "")
+    challenge = params.get("hub.challenge", "")
+    verify_token = os.environ.get("FB_VERIFY_TOKEN", "").strip()
+    if mode == "subscribe" and verify_token and token == verify_token:
+        return PlainTextResponse(challenge)
+    raise HTTPException(status_code=403, detail="verify token မမှန်ပါ")
+
+
+@app.post("/messenger-webhook")
+async def messenger_webhook(request: Request):
+    raw = await request.body()
+    if not fb_verify_signature(raw, request.headers.get("x-hub-signature-256", "")):
+        raise HTTPException(status_code=403, detail="signature မမှန်ပါ")
+    try:
+        data = json.loads(raw.decode("utf-8") or "{}")
+    except Exception:
+        return {"ok": True}
+    if not isinstance(data, dict) or data.get("object") != "page":
+        return {"ok": True}
+    for entry in data.get("entry") or []:
+        if not isinstance(entry, dict):
+            continue
+        for ev in entry.get("messaging") or []:
+            if not isinstance(ev, dict):
+                continue
+            msg = ev.get("message") or {}
+            if not isinstance(msg, dict) or msg.get("is_echo"):
+                continue
+            text = (msg.get("text") or "").strip()
+            sender = (ev.get("sender") or {}).get("id", "")
+            if not text or not sender:
+                continue
+            reply = match_messenger_reply(text)
+            await fb_send_message(sender, reply)
+    return {"ok": True}
 
 
 if __name__ == "__main__":
