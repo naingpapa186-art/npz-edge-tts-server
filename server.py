@@ -55,6 +55,9 @@ import json
 import os
 import re
 import tempfile
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 import edge_tts
 import httpx
@@ -93,6 +96,7 @@ GEMINI_MODELS = {
     "gemini-3.1-pro-preview",
     "gemini-3.7-flash",
     "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
 }
 
 ELEVEN_MODELS = {
@@ -263,6 +267,49 @@ class ElevenVoicesRequest(BaseModel):
         return v
 
 
+FOOTBALL_LEAGUES = {"eng.1", "esp.1", "ita.1", "ger.1", "fra.1", "uefa.champions"}
+NEWS_UA = {"User-Agent": "Mozilla/5.0 (compatible; NPZNewsRecap/1.0)"}
+
+
+class NewsFetchRequest(BaseModel):
+    url: str
+    limit: int = 20
+
+    @field_validator("url")
+    @classmethod
+    def url_ok(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("URL က http(s):// နဲ့ စရမယ်")
+        return v
+
+    @field_validator("limit")
+    @classmethod
+    def limit_ok(cls, v: int) -> int:
+        return max(1, min(50, int(v or 20)))
+
+
+class FootballRequest(BaseModel):
+    league: str = "eng.1"
+    date: str = ""
+
+    @field_validator("league")
+    @classmethod
+    def league_known(cls, v: str) -> str:
+        v = (v or "").strip()
+        if v not in FOOTBALL_LEAGUES:
+            raise ValueError("လိဂ် မမှန်ပါ")
+        return v
+
+    @field_validator("date")
+    @classmethod
+    def date_ok(cls, v: str) -> str:
+        v = (v or "").strip()
+        if v and not re.fullmatch(r"\d{8}", v):
+            raise ValueError("date က YYYYMMDD ပုံစံ ဖြစ်ရမယ်")
+        return v
+
+
 async def make_mp3(text: str, voice: str, rate: str) -> str:
     tmp = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
     tmp.close()
@@ -358,7 +405,7 @@ async function aStart(){
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "voices": list(VOICES.keys())[:2], "gemini": True, "elevenlabs": True, "assemblyai": True, "messenger": True}
+    return {"ok": True, "voices": list(VOICES.keys())[:2], "gemini": True, "elevenlabs": True, "assemblyai": True, "messenger": True, "news": True, "football": True}
 
 
 @app.post("/tts")
@@ -1334,6 +1381,147 @@ async def messenger_webhook(request: Request):
             reply = match_messenger_reply(text)
             await fb_send_message(sender, reply)
     return {"ok": True}
+
+
+def _parse_news_date(s: str):
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        dt = parsedate_to_datetime(s)
+        if dt is not None:
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _strip_html(text: str) -> str:
+    text = re.sub(r"<script.*?</script>|<style.*?</style>", " ", text or "", flags=re.S | re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1] if "}" in tag else tag
+
+
+@app.post("/news-fetch")
+async def news_fetch(req: NewsFetchRequest):
+    url = req.url
+    try:
+        async with httpx.AsyncClient(timeout=30.0, headers=NEWS_UA, follow_redirects=True) as client:
+            resp = await client.get(url)
+    except httpx.TimeoutException:
+        return JSONResponse(status_code=504, content={"ok": False, "status": 504, "error": "သတင်းဆိုက် timeout"})
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"ok": False, "status": 502, "error": f"သတင်းဆိုက် ခေါ်မရပါ: {e}"})
+    if resp.status_code != 200:
+        return JSONResponse(status_code=resp.status_code, content={"ok": False, "status": resp.status_code, "error": "သတင်းဆိုက် မရပါ"})
+    body = resp.text or ""
+    head = body[:2000]
+    if "<rss" in head or "<feed" in head or body.lstrip().startswith("<?xml"):
+        try:
+            root = ET.fromstring(body)
+        except Exception:
+            return JSONResponse(status_code=502, content={"ok": False, "error": "RSS ဖတ်မရပါ"})
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(hours=24)
+        items = []
+        dated = False
+        for el in root.iter():
+            if _local(el.tag) not in ("item", "entry"):
+                continue
+            fields = {}
+            for child in el:
+                name = _local(child.tag)
+                if name == "link":
+                    fields.setdefault("link", (child.get("href") or "") or (child.text or "").strip())
+                elif name in ("title", "pubDate", "published", "updated", "description", "summary"):
+                    fields[name] = (child.text or "").strip()
+            title = fields.get("title", "")
+            if not title:
+                continue
+            pub = fields.get("pubDate") or fields.get("published") or fields.get("updated") or ""
+            dt = _parse_news_date(pub)
+            if dt is not None:
+                dated = True
+                if dt < cutoff:
+                    continue
+            desc = _strip_html(fields.get("description") or fields.get("summary") or "")[:500]
+            items.append({"title": title, "link": fields.get("link", ""), "published": pub, "published_ts": dt.timestamp() if dt else None, "description": desc})
+            if len(items) >= req.limit:
+                break
+        return {"ok": True, "kind": "feed", "items": items, "count": len(items), "only_24h": dated, "source": url}
+    m = re.search(r"<title[^>]*>(.*?)</title>", body, flags=re.S | re.I)
+    title = _strip_html(m.group(1)) if m else ""
+    return {"ok": True, "kind": "article", "title": title, "text": _strip_html(body)[:8000], "source": url}
+
+
+@app.post("/football")
+async def football(req: FootballRequest):
+    params = {}
+    if req.date.strip():
+        params["dates"] = req.date.strip()
+    try:
+        async with httpx.AsyncClient(timeout=30.0, headers=NEWS_UA) as client:
+            resp = await client.get(
+                f"https://site.api.espn.com/apis/site/v2/sports/soccer/{req.league}/scoreboard",
+                params=params,
+            )
+    except httpx.TimeoutException:
+        return JSONResponse(status_code=504, content={"ok": False, "status": 504, "error": "ESPN timeout"})
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"ok": False, "status": 502, "error": f"ESPN ခေါ်မရပါ: {e}"})
+    if resp.status_code != 200:
+        return JSONResponse(status_code=resp.status_code, content={"ok": False, "status": resp.status_code, "error": "ESPN မရပါ"})
+    try:
+        data = resp.json()
+    except Exception:
+        return JSONResponse(status_code=502, content={"ok": False, "error": "ESPN ပြန်ပေးတာ ဖတ်မရပါ"})
+    matches = []
+    for ev in data.get("events") or []:
+        if not isinstance(ev, dict):
+            continue
+        comps = ev.get("competitions") or []
+        comp = comps[0] if comps else {}
+        home = away = None
+        for c in comp.get("competitors") or []:
+            if not isinstance(c, dict):
+                continue
+            team = c.get("team") or {}
+            side = {"name": team.get("displayName", ""), "short": team.get("shortDisplayName", ""), "score": c.get("score", ""), "winner": bool(c.get("winner"))}
+            if c.get("homeAway") == "home":
+                home = side
+            else:
+                away = side
+        scorers = []
+        for d in comp.get("details") or []:
+            if not isinstance(d, dict):
+                continue
+            athletes = d.get("athletes") or []
+            names = ", ".join(a.get("displayName", "") for a in athletes if isinstance(a, dict) and a.get("displayName"))
+            scorers.append({
+                "minute": (d.get("clock") or {}).get("displayValue", ""),
+                "team": (d.get("team") or {}).get("shortDisplayName", ""),
+                "type": (d.get("type") or {}).get("text", ""),
+                "players": names,
+            })
+        matches.append({
+            "id": ev.get("id", ""),
+            "date": ev.get("date", ""),
+            "name": ev.get("name", ""),
+            "status": (ev.get("status") or {}).get("type", {}).get("detail", ""),
+            "home": home,
+            "away": away,
+            "scorers": scorers,
+            "venue": (comp.get("venue") or {}).get("fullName", ""),
+        })
+    return {"ok": True, "league": req.league, "matches": matches, "count": len(matches)}
 
 
 if __name__ == "__main__":
